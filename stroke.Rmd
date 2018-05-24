@@ -1,0 +1,1116 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+<!-- --- -->
+<!-- title: "R Notebook" -->
+<!-- output: -->
+<!--   html_document: -->
+<!--     df_print: paged -->
+<!-- --- -->
+
+```{r head, message=F, echo=F}
+options(scipen = 10)
+
+library(biomaRt)
+library(data.table)
+library(ggplot2)
+library(readr)
+library(xlsx)
+library(dplyr)
+library(stringr)
+library(knitr)
+library(kableExtra)
+library(foreign)
+library(fastmatch)
+library(progress)
+library(ggplot2)
+
+library(tictoc)
+
+na_replace <- function(x, value=NA){
+	x[is.na(x)] <- value
+	return(x)
+}
+ensg_name <- function(x, biomart_annot=biomart_annot, ensg_to_name=NULL){
+	if(is.null(ensg_to_name)){
+		if(length(x) > 0){
+			ensg_to_name = str_to_upper(str_sub(x[1], end=4)) == "ENSG"
+		}else{
+			return("")
+		}
+	}
+	if(ensg_to_name){
+		genes <- biomart.annot[fmatch(x, `Gene stable ID`), `Gene name`]
+	}	else{
+		x <- str_to_upper(x)
+		genes <- biomart.annot[fmatch(x, toupper(`Gene name`)), `Gene stable ID`]
+	}
+	return(genes)
+}
+```
+
+LAA - large-artery atherosclerosis
+CE - cardioembolism
+SAO - small-artery occlusion
+OC - stroke of other determined cause
+UND - stroke of undetermined cause
+
+Za https://www.ncbi.nlm.nih.gov/pubmed/20580256
+
+# Read and prepare data
+```{r reading_data, echo=F, warning=F}
+read_csv("data-caspar/Marz2018_Krakow Inbreeding Caspar.csv", col_types='iiiiiiicccnd') %>% 
+	rename(chr=Chr, start_position=StartPosition, end_position=EndPosition, 
+				 n_snp=N_SNP, length=Length, state=State, cn=CN, patient=SampleID, 
+				 start_snp=SatrtSNP, end_snp=EndSNP, confidence=Confidence) %>% 
+	mutate(patient_id = as.integer(str_split(patient, "@", simplify = T)[, 1])) %>% 
+	select(chr:patient, patient_id, start_snp:X12) ->
+	data.raw
+
+read.xlsx("data-caspar/Krakow non-curated.xlsx", sheetIndex=1) %>% 
+	tbl_df %>% 
+	rename(patient=Patient, toast_control=TOAST.control, X3=NA., age=Age, sex=sex, 
+				 roh=RoH..sum.of.all.segments., roh_1000snps=RoH..sum.of.segments..1000.SNPs) %>% 
+	mutate_if(is.factor, as.character) %>% 
+	mutate(patient_id = as.integer(str_split(patient, "@", simplify = T)[, 1])) %>% 
+	mutate(sex = ifelse(sex==1, "male", "female")) %>% 
+	select(-roh, -roh_1000snps, -X3) ->
+	non.curated
+
+read.xlsx2("data-caspar/Cryptic relatedness Krakow.xlsx", sheetIndex=1) %>% 
+	rename(f_id1=FID1, toast1=TOAST1, f_id2=FID2, toast2=TOAST2, ratio=RATIO, age_diff=Age.diff) %>% 
+	mutate(all_empty_columns = f_id1=="" & f_id2=="") %>% 
+	filter(!all_empty_columns) %>% 
+	select(-all_empty_columns) %>% 
+	mutate_if(is.factor, as.character) %>% 
+	# mutate(ratio =as.double(ratio)) %>% 
+	mutate_at(vars(-toast1, -toast2, -interpretation), as.numeric) %>%  # NAs introduced by coercion
+	mutate(toast1 = ifelse(toast1=="", "control", toast1), 
+				 toast2 = ifelse(toast2=="", "control", toast2)) ->
+	cryptic.relatedness
+
+read_csv("data/Phenotypes_Krakow.csv", col_types='cicicccici') %>% 
+	rename(study_id=studyID, patient_id=uID, toast_class=toastClass, 
+				 ccs_causative=CCScausative, ccs_phenotypic=CCSphenotypic, 
+				 m_rs=mRS, status=Status, loh=LOH) %>% 
+	select(-study_id, -ccs_causative, -ccs_phenotypic) ->
+	phenotypes
+
+# data with phenotypes
+data.raw %>% 
+	left_join(non.curated, by=c("patient", "patient_id")) %>%  # można połączyć z phenotypes i sprawdzić gdzie są róznice w fenotypowaniu
+	filter(cn==2) %>%
+	filter(n_snp >= 1000) %>%
+	group_by(patient_id) %>% 
+	mutate(roh_total = sum(length) / 1e6) %>% 
+	mutate(roh_total = round(roh_total, 2)) %>%
+	ungroup() ->
+	data
+
+# data %>% 
+# 	filter(toast_control != "control") %>% 
+# 	distinct(patient_id) %>% 
+# 	dim() %>% 
+# 	`[`(1) ->
+# 	n.stroke.patients
+# 
+# data %>% 
+# 	filter(toast_control == "control") %>% 
+# 	distinct(patient_id) %>% 
+# 	dim() %>% 
+# 	`[`(1) ->
+# 	n.control.patients
+
+biomart.annot <- read_csv("data/biomart-grch37-annot.txt", col_types = "cciic")
+biomart.annot <- data.table(biomart.annot, key=c("Gene stable ID", "Gene name"))  # for faster lookup
+
+###### temporarily not needed
+rm(cryptic.relatedness, data.raw, non.curated, phenotypes)
+```
+
+# Reading HPO data
+
+http://human-phenotype-ontology.github.io/downloads.html
+
+http://compbio.charite.de/hpoweb/showterm?id=HP:0000118#id=HP:0001626
+http://compbio.charite.de/hpoweb/APP/global/2/legacy/1/genes_for_HP:0007289.csv
+
+```{python engine.path="/usr/bin/python3.5", eval=F}
+import sys
+sys.path.insert(0, 'data/hpo/')
+from head import *
+hp_db = read_object('data/hpo/hp_db')
+
+
+# czy get_children_genes zawiera się w get_all_genes?
+
+#dump_all(hp_db, path='data/hpo-genes')	
+i=0
+for id, child in hp_db.items():
+  if len(child.get_genes()) != 0:
+    i+=1
+print(i)
+print(len(hp_db))
+print(len(hp_db['HP:0000001'].get_children_ids(all_children=True)))
+# jak uzyskano plik: children of hp_0001626
+```
+
+```{r}
+# hp.data <- 
+#TODO usunoac ostatnie wiersz z HP pobieranych ręcznie, dorzuca jako gen: Total
+read_tsv("data/hpo-genes/hp-db-genes.txt", col_names=c("hp", "gene", "name"), col_types='ccc') %>% 
+	mutate(gene_id = ensg_name(gene)) %>% 
+	data.table(key="hp") ->  # for faster lookup
+	hp.data
+cardiovascular <- read_lines("data/Children of HP_0001626 (cardiovascular).txt")
+```
+
+
+# Preliminary analysis
+
+Nieznalezione geny w ensembl
+```{r}
+hp.data %>% 
+	filter(is.na(gene_id)) %>% 
+	pull(gene) %>% 
+	unique() %>% 
+	paste0(collapse="\n") %>% 
+	cat
+```
+
+Plik: Krakow non-curated
+Trzecia kolumna zawiera 0 i 1. 0 to kontorla 1 to udar (poza jednym).
+```{r pre_analysis_1, eval=F}
+non.curated %>% 
+	mutate(toast_eq_x3 = toast_control=="control" & X3==0 | toast_control!="control" & X3==1) %>% 
+	filter(!toast_eq_x3)
+	distinct(toast_control, X3, sex)
+```
+
+Tabele Cryptic relatedness i non-curated zgadzają się ze sobą (pacjenici należą do tych samych grup)
+```{r pre_analysis_2, eval=F}
+cryptic.relatedness %>% 
+	mutate(toast1 = ifelse(toast1 == "UND", "UND/UNCL", toast1)) %>% 
+	mutate(toast_1 = toast1 == non.curated$toast_control[match(f_id1, non.curated$patient_id)]) %>% 
+	pull(toast_1) %>% 
+	all()
+
+cryptic.relatedness %>% 
+	mutate(toast2 = ifelse(toast2 == "UND", "UND/UNCL", toast2)) %>% 
+	mutate(toast_2 = toast2 == non.curated$toast_control[match(f_id2, non.curated$patient_id)]) %>% 
+	pull(toast_2) %>% 
+	all()
+```
+
+Drobne różnice w fenotypowaniu
+```{r pre_analysis_3, eval=F}
+print("SPSS")
+data.frame(read.spss("data-caspar/KRAKOW april 2018.sav")) %>% 
+	pull(TOAST) %>% 
+	table
+print("non-curated")
+non.curated %>% 
+	pull(toast_control) %>% 
+	table
+print("Phenotypes")
+phenotypes %>% 
+	pull(toast_class) %>% 
+	na_replace("control") %>% 
+	table
+
+setdiff(non.curated$patient_id, data_raw$patient_id)
+```
+
+Dla 33 pacjentów są różnice w całkowietej długości ROH podanej w non-crated z policzonymi.
+```{r pre_analysis_4, eval=F}
+data_raw %>% 
+	left_join(non.curated, by=c("patient", "patient_id")) %>%  # można połączyć z phenotypes i sprawdzić gdzie są róznice w fenotypowaniu
+	filter(cn==2) %>% 
+	# filter(n_snp >= 1000) %>%
+	group_by(patient_id) %>% 
+	mutate(roh_total = sum(length) / 1e6) %>% 
+	mutate(roh_total_round = round(roh_total)) %>% 
+	mutate(is_roh_equal = roh==roh_total_round) %>% 
+	# mutate(is_roh_equal = roh_1000snps == roh_total_round) %>% 
+	filter(!is_roh_equal) %>% 
+	pull(patient_id) %>% 
+	unique
+```
+
+Procent osób z całkowitą długością ROH >= 20Mb
+```{r pre_analysis_5, eval=F}
+data %>% 
+	distinct(patient_id, .keep_all=T) %>% 
+	select(patient_id, toast_control, roh_total, n_snp) %>% 
+	mutate(stroke = toast_control!="control") ->
+	.data.for.summary
+	
+.data.for.summary %>% 
+	group_by(toast_control) %>% 
+	summarise(n = n(), with_long_roh = sum(roh_total >= 20)) %>% 
+	arrange(match(toast_control, c("LAA", "CE", "SAO", "OC", "UND/UNCL", "control"))) %>% 
+	mutate(ratio = round(with_long_roh / n * 100))
+
+.data.for.summary %>% 
+	group_by(stroke) %>% 
+	summarise(n = n(), with_long_roh = sum(roh_total >= 20)) %>% 
+	arrange(match(stroke, c("LAA", "CE", "SAO", "OC", "UND/UNCL", "control"))) %>% 
+	mutate(ratio = round(with_long_roh / n * 100))
+
+.data.for.summary %>% 
+	filter(n_snp >= 1000) %>% 
+	group_by(toast_control) %>% 
+	summarise(n = n(), with_long_roh = sum(roh_total >= 20)) %>% 
+	arrange(match(toast_control, c("LAA", "CE", "SAO", "OC", "UND/UNCL", "control"))) %>% 
+	mutate(ratio = round(with_long_roh / n * 100))
+
+.data.for.summary %>% 
+	filter(n_snp >= 1000) %>% 
+	group_by(stroke) %>% 
+	summarise(n = n(), with_long_roh = sum(roh_total >= 20)) %>% 
+	arrange(match(stroke, c("LAA", "CE", "SAO", "OC", "UND/UNCL", "control"))) %>% 
+	mutate(ratio = round(with_long_roh / n * 100))
+```
+
+# Analysis
+
+## Liczba genów i całkowita długość ROH dla każego pacjenta
+Do danych data zostały policzone i dodane kolumny z ilością genów znajdujących się w ROH i jego długość
+```{r , }
+if(!exists("ensembl")){
+	ensembl <- useEnsembl(biomart="ENSEMBL_MART_ENSEMBL", dataset="hsapiens_gene_ensembl", GRCh = 37)
+}
+
+# download all genes from homozygosity regions
+data %>% 
+	select(patient_id, chr, start_position, end_position) %>% 
+	mutate(values = paste(chr, start_position, end_position, sep=":")) %>% 
+	pull(values) %>% 
+	{getBM(attributes = c("ensembl_gene_id", "chromosome_name", "start_position", "end_position"),
+				 filters = c("chromosomal_region", "biotype"),
+				 values = list("chromosomal_region"=., "biotype"="protein_coding"),
+				 mart = ensembl)} %>%
+	rename(chr = chromosome_name) ->
+	roh.genes.data
+
+# map genes to regions and patients
+data %>% 
+	select(chr, start_position, end_position, patient_id) %>% 
+	mutate(patient_id = as.character(patient_id)) %>% 
+	bind_rows(roh.genes.data) ->
+	.data2
+
+.data2 %>% 
+	select(chr, end_position, patient_id, ensembl_gene_id) %>% 
+	mutate(is_start=F) %>% 
+	rename(start_end = end_position) ->
+	.data3
+	
+.data2 %>%
+	select(chr, start_position, patient_id, ensembl_gene_id) %>% 
+	mutate(is_start=T) %>% 
+	rename(start_end = start_position) %>% 
+	bind_rows(.data3) %>% 
+	arrange(chr, start_end) %>% 
+	filter(!(is.na(patient_id) & is_start == F)) ->
+	.data.gene.counts
+
+env.patients.to.genes <- new.env()
+for(id in format(unique(data$patient_id), scientific=F)){
+	assign(id, character(0), env.patients.to.genes)
+}
+env.genes.to.patients <- new.env()
+for(id in roh.genes.data$ensembl_gene_id){
+	assign(id, character(0), env.genes.to.patients)
+}
+
+patients.id <- character(0)
+for(i in 1:dim(.data.gene.counts)[1]){
+	pt.id <- .data.gene.counts$patient_id[i]
+	if(!is.na(pt.id)){
+		if(.data.gene.counts$is_start[i]){
+			patients.id <- c(patients.id, pt.id)
+		}else{
+			patients.id <- patients.id[!patients.id %in% pt.id]
+		}
+	}else{
+		for(p in patients.id){
+			# env[[p]] <- env[[p]] + 1
+			env.patients.to.genes[[p]] <- c(env.patients.to.genes[[p]], .data.gene.counts$ensembl_gene_id[i])
+		}
+		# ensg <- .data.gene.counts$ensembl_gene_id[i]
+		env.genes.to.patients[[.data.gene.counts$ensembl_gene_id[i]]] <- patients.id
+	}
+}
+
+.patients.to.genes.count <- list()
+for(id in names(env.patients.to.genes)){
+	.patients.to.genes.count[[id]] <- length(env.patients.to.genes[[id]])
+}
+as.data.frame(.patients.to.genes.count) %>% 
+	t %>% 
+	as.data.frame %>% 
+	mutate(patient_id=as.numeric(str_match(rownames(.), "X(.*)")[,2])) %>% 
+	rename(n_genes=V1) ->
+	.n.genes
+
+data %>% 
+	left_join(.n.genes, by="patient_id") ->
+	data
+```
+
+Różnice w ilosciach genow wynika z tego, że biorac liste genów dla kazdego pacjenta osobno
+ensembl zwraca tez gen, który zaczyna(konczy - strand?) sie takze poza rejonem, a konczy juz 
+w zadanym rejonie. 
+
+```{r check_n_genes, eval=F}
+.patient <- 2000000075
+genes.regions <<- tibble("ensembl_gene_id"=character(0), "chromosome_name"=integer(0), "start_position"=integer(0), "end_position"=integer(0))
+genes_number <- function(chr, start, end){
+	getBM(attributes = c("ensembl_gene_id", "chromosome_name", "start_position", "end_position"),
+				 filters = c("chromosome_name", "start", "end"),
+				 values = list("chromosome_name"=chr, "start"=start, "end"=end),
+				 mart = ensembl) ->
+		a 
+
+	genes.regions %>% 
+		bind_rows(a) ->>
+		genes.regions
+
+	a %>% 		
+		summarise(n=n()) %>% 
+		pull(n)
+}
+
+# separate regions
+data %>% 
+	select(patient_id, chr, start_position, end_position) %>% 
+	filter(patient_id==.patient) ->
+	regions
+
+regions %>% 
+	rowwise() %>%
+	mutate(n_genes_ensembl = genes_number(chr, start_position, end_position)) ->
+	regions_n
+
+regions_n %>% 
+	pull(n_genes_ensembl) %>% 
+	sum
+
+# collective region
+data %>% 
+	select(patient_id, chr, start_position, end_position) %>% 
+	filter(patient_id==.patient) %>% 
+	mutate(values = paste(chr, start_position, end_position, sep=":")) %>% 
+	pull(values) %>%  
+	paste0(collapse=",") -> 
+	collective.regions
+
+getBM(attributes = c("ensembl_gene_id", "chromosome_name", "start_position", "end_position"),
+				 filters = c("chromosomal_region"),
+				 values = collective.regions,
+				 mart = ensembl) ->
+	b
+
+genes.coll.regions <- b
+
+b %>% 
+	summarise(n=n()) %>% 
+	pull(n)
+
+# geny rozniace moj sposob z osobnym pobieraniem dla kazdego pacjenta
+# Gene stable ID	Gene start (bp)	Gene end (bp)	Chromosome/scaffold name
+# ENSG00000007402	50400233	50541675	3
+# ENSG00000055813	56411258	56613308	2
+# ENSG00000104320	90945564	91015456	8
+# ENSG00000228971	95975672	96247898	1
+# ENSG00000230561	127039082	127277326	5
+# ENSG00000271894	56374765	56613306	2
+```
+
+## Istotność genów (nadreprezentacja w stroke)
+
+### Średnia dla danej grupy genów
+* Dany pacjent -> ile ma genów ze wskazanej listy
+* Testy na dwóch grupach
+```{r}
+genes.list1 <- read_lines("data/genes-list1")
+genes.list1 <- ensg_name(genes.list1)
+
+genes.list2 <- read_lines("data/genes-list2")
+genes.list2 <- ensg_name(genes.list2)
+
+data %>% 
+	select(patient_id, toast_control, roh_total) %>% 
+	mutate(patient_id=as.character(patient_id)) %>% 
+	distinct() ->
+	data.an
+
+l1 <- numeric(0)
+l2 <- numeric(0)
+for(id in data.an$patient_id){
+	l1 <- c(l1, sum(env.patients.to.genes[[id]] %in% genes.list1))
+	l2 <- c(l2, sum(env.patients.to.genes[[id]] %in% genes.list2))
+}
+
+data.an %>% 
+	bind_cols(list1=l1) %>% 
+	bind_cols(list2=l2) %>% 
+	group_by(toast_control) %>% 
+	summarise(m_list1 = mean(list1), m_list2 = mean(list2), med=median(roh_total), mea=mean(roh_total)) %>% 
+	arrange(match(toast_control, c("LAA", "CE", "SAO", "OC", "UND/UNCL", "control"))) %>% 
+	mutate(m_list1_mean = m_list1 / mea, m_list2_mean = m_list2 / mea) %>% 
+	select(toast_control, m_list1_mean, m_list2_mean)
+```
+
+### Test chi-kwadrat
+Test chi-kwadrat dla każdego genu  
+Contingencty table - liczba pacjentów z danym genem w rejonach homozygotycznych
+
+X | SAO/LAA/... | control
+------------- | ----------- | -------
+covered				|		5					|				1
+not covered		|		120				|			200
+
+```{r}
+pval <- numeric(0)
+
+data %>% 
+	select(patient_id, toast_control) %>% 
+	distinct(patient_id, .keep_all=T) %>% 
+	data.table(key="patient_id") ->  # for faster lookup
+	data.stroke
+
+n.control.patients <- sum(data.stroke$toast_control == "control")
+n.stroke.patients <- sum(data.stroke$toast_control != "control")
+
+tic()
+for(ensg in roh.genes.data$ensembl_gene_id){
+	patients <- as.numeric(env.genes.to.patients[[ensg]])
+
+	data.stroke[.(patients),]$toast_control ->
+		.covered.stroke.patients
+	
+	b <- c(sum(.covered.stroke.patients=="control"), sum(.covered.stroke.patients!="control"))
+	n <- c(n.control.patients, n.stroke.patients)
+	.contig.table <- matrix(c(b, n - b), ncol=2, byrow=T)
+
+	pval <- c(pval, suppressWarnings(chisq.test(.contig.table, simulate.p.value=F, B=5000)$p.value))
+	
+}
+toc()#25s
+```
+
+Wyniki i diagnostyka test
+```{r}
+pval.sorted <- sort(pval)
+plot(seq(0, 1, length.out=length(pval.sorted)), pval.sorted)
+abline(0, 1)
+
+#TODO można poprawić wykres to podobnego jak niżej
+# qqx <- quantile(vascular.pvals, seq(0, 1, 0.01), na.rm=T, names=F)
+# qqy <- quantile(non.vascular.pvals, seq(0, 1, 0.01), na.rm=T, names=F)
+# qqplot(-log10(vascular.pvals), -log10(non.vascular.pvals))
+# abline(0, 1, col="red", lw=2)
+
+roh.genes.data$ensembl_gene_id[order(pval)[1:30]]
+ensg_name(roh.genes.data$ensembl_gene_id[order(pval)[1:30]])
+
+hp.data %>% 
+	filter(gene %in% ensg_name(roh.genes.data$ensembl_gene_id[order(pval)[1:30]])) %>% 
+	filter(hp %in% cardiovascular) %>% 
+	arrange(hp)
+```
+
+### Test Manna Whitneya Wilcoxona
+
+próba x 0 0 1 2 4 0 0 1 ilość genów odpowiednio dla SAO, LAA, ..., stroke  
+próba y 1 0 0 2 0 1 0 0 ilość genow z listy dla control
+
+```{r}
+data %>% 
+	select(patient_id, toast_control, roh_total) %>% 
+	mutate(patient_id=as.character(patient_id)) %>% 
+	distinct() %>% 
+	data.table(key="toast_control") ->
+	data.wilcoxon
+##### przenieść do góry(?) - to są tylko ogólne statystyki(?)
+data.wilcoxon %>%
+	group_by(toast_control = ifelse(toast_control!="control", "stroke", "control")) %>%
+	filter(toast_control=="stroke") %>%
+	summarise(roh_mean=mean(roh_total)) ->
+	.stroke.roh.means
+data.wilcoxon %>%
+	group_by(toast_control) %>%
+	summarise(roh_mean=mean(roh_total)) %>%
+	bind_rows(.stroke.roh.means) ->
+	roh.means
+#####
+tic()
+results <- tibble("toast_control"=character(),
+									"vascular"=logical(),
+									"HP"=character(),
+									"mean"=double(),
+									"pval"=double(),
+									"fold"=double(),
+									"roh_fold"=double(),
+									"n_genes"=numeric(),
+						 			"name"=character())
+
+hp.data %>% pull(hp) %>% unique() -> hps
+
+hp.data %>% pull(name) %>% unique() -> names
+pb <- progress_bar$new(format = "  whitney [:bar] :percent eta: :eta", total = length(hps))
+
+	.ilaa <- data.wilcoxon$toast_control=="LAA"
+	.ice <- data.wilcoxon$toast_control=="CE"
+	.isao <- data.wilcoxon$toast_control=="SAO"
+	.ioc <- data.wilcoxon$toast_control=="OC"
+	.iund <- data.wilcoxon$toast_control=="UND/UNCL"
+	.istroke <- data.wilcoxon$toast_control!="control"
+	.icontrol <- data.wilcoxon$toast_control=="control"
+	roh.genes.unique <- roh.genes.data %>% pull(ensembl_gene_id) %>% unique
+	
+for(i in 1:length(hps)){
+	name <- hp.data[hp==hps[i], name][1]
+	genes.list <- hp.data[hp==hps[i], gene_id]
+	genes.list <- intersect(genes.list, roh.genes.unique) # fix
+
+	hp <- hps[i]
+
+	vascular <- hp %fin% cardiovascular #27
+
+	genes.counts <- sapply(data.wilcoxon$patient_id, function(x) sum(env.patients.to.genes[[x]] %fin% genes.list))  # 103
+
+	.laa <- genes.counts[.ilaa]
+	.ce <- genes.counts[.ice]
+	.sao <- genes.counts[.isao]
+	.oc <- genes.counts[.ioc]
+	.und <- genes.counts[.iund]
+	.stroke <- genes.counts[.istroke]
+	.control <- genes.counts[.icontrol]
+
+	means <- sapply(list(.laa, .ce, .sao, .oc, .und, .stroke, .control), mean)
+
+	pvals <- sapply(list(.laa, .ce, .sao, .oc, .und, .stroke, .control), function(x) wilcox.test(x, .control)$p.value)
+
+	folds <- means / mean(.control)  # 230
+
+	results %>%
+		bind_rows(tibble("toast_control"=c("LAA", "CE", "SAO", "OC", "UND/UNCL", "stroke", "control"),
+										 "vascular"=vascular,
+										 "HP"=hp,
+										 "mean"=means,
+										 "pval"=pvals,
+										 "fold"=folds,
+										 #TODO co to miało byc?
+										 # "roh_fold"=
+										 "n_genes"=length(genes.list),
+										 "name"=name)) ->
+		results
+	pb$tick()
+}
+results %>% 
+	left_join(roh.means, by="toast_control") ->
+	results
+
+toc() #57s (dla vascular), 282s (dla wszystkich)
+
+results %>% 
+	group_by(HP) %>% 
+	mutate(min_pval = min(pval)) %>% 
+	mutate(max_fold = max(fold)) %>% 
+	ungroup ->
+	results
+```
+
+### Bootstrap
+
+Wyniki bootstrapowe
+
+Stworzenie environment gdzie po podaniu nazwy genu dostajemy średnie dla poszczególnych grup -znacznie przyspiesza bootstrap
+```{r}
+# lista
+# lista[["gen"]] > c("laa"=c(0,0,0,0,0,1,0,0,1,0,0,0,0), "sao"=c(), ..., "control"=c())
+# możemy policzyć średnią, potem wybieryamy z listy geny i dla laa, saa liczymy sumę średnich
+# będzie tak samo jak wcześniej
+
+all.hp.genes <- hp.data %>% pull(gene_id) %>% na.omit %>% unique
+all.roh.genes <- roh.genes.data %>% pull(ensembl_gene_id) %>% unique
+all.hp.roh.genes <- intersect(all.roh.genes, all.hp.genes)  # fix
+
+data %>% 	filter(toast_control=="LAA") %>% 	pull(patient_id) %>% 	unique %>% 	as.character() -> laa_patients
+data %>% 	filter(toast_control=="CE") %>% 	pull(patient_id) %>% 	unique %>% 	as.character() -> ce_patients
+data %>% 	filter(toast_control=="SAO") %>% 	pull(patient_id) %>% 	unique %>% 	as.character() -> sao_patients
+data %>% 	filter(toast_control=="OC") %>% 	pull(patient_id) %>% 	unique %>% 	as.character() -> oc_patients
+data %>% 	filter(toast_control=="UND/UNCL") %>% 	pull(patient_id) %>% 	unique %>% 	as.character() -> und_patients
+data %>% 	filter(toast_control!="control") %>% 	pull(patient_id) %>% 	unique %>% 	as.character() -> stroke_patients
+data %>% 	filter(toast_control=="control") %>% 	pull(patient_id) %>% 	unique %>% 	as.character()  -> control_patients
+
+.ptgc_laa <- numeric(length(laa_patients))
+.ptgc_ce <- numeric(length(ce_patients))
+.ptgc_sao <- numeric(length(sao_patients))
+.ptgc_oc <- numeric(length(oc_patients))
+.ptgc_und <- numeric(length(und_patients))
+.ptgc_stroke <- numeric(length(stroke_patients))
+.ptgc_con <- numeric(length(control_patients))
+
+patients.length <- c(length(laa_patients),length(ce_patients),length(sao_patients),length(oc_patients),length(und_patients),length(stroke_patients),length(control_patients))
+
+pb3 <- progress_bar$new(format = "  calculating mean [:bar] :percent eta: :eta", total = length(all.hp.roh.genes))
+env.genes.to.mean.cnv <- new.env()
+for(gene in all.hp.roh.genes){
+	# microbenchmark({
+	# 	sums <- c(sum(.ptgc_laa), sum(.ptgc_ce), sum(.ptgc_sao), sum(.ptgc_oc), sum(.ptgc_und), sum(.ptgc_stroke), sum(.ptgc_con))
+	# 	}
+	# )
+	# microbenchmark({
+	# 	sums2 <- sapply(list(.ptgc_laa, .ptgc_ce, .ptgc_sao, .ptgc_oc, .ptgc_und, .ptgc_stroke, .ptgc_con), sum)
+	# }
+	# )
+	
+		for(j in 1:length(laa_patients)){
+			.ptgc_laa[j] <- gene %fin% env.patients.to.genes[[laa_patients[j]]]
+		}
+		for(j in 1:length(ce_patients)){
+			.ptgc_ce[j] <- gene %fin% env.patients.to.genes[[ce_patients[j]]]
+		}
+		for(j in 1:length(sao_patients)){
+			.ptgc_sao[j] <- gene %fin% env.patients.to.genes[[sao_patients[j]]]
+		}
+		for(j in 1:length(oc_patients)){
+			.ptgc_oc[j] <- gene %fin% env.patients.to.genes[[oc_patients[j]]]
+		}
+		for(j in 1:length(und_patients)){
+			.ptgc_und[j] <- gene %fin% env.patients.to.genes[[und_patients[j]]]
+		}
+		for(j in 1:length(stroke_patients)){
+			.ptgc_stroke[j] <- gene %fin% env.patients.to.genes[[stroke_patients[j]]]
+		}
+		for(j in 1:length(control_patients)){
+			.ptgc_con[j] <- gene %fin% env.patients.to.genes[[control_patients[j]]]
+		}
+	sums <- c(sum(.ptgc_laa), sum(.ptgc_ce), sum(.ptgc_sao), sum(.ptgc_oc), sum(.ptgc_und), sum(.ptgc_stroke), sum(.ptgc_con))
+	
+	assign(gene, sums / patients.length, env.genes.to.mean.cnv)
+	
+	pb3$tick()
+}
+# save.image('bootstrap.RData')
+```
+
+```{r, eval=F}
+load('bootstrap.RData')  #
+
+results %>%  # results to plik z poprzedniego testu Wilcoxona, używam go bo tam liczyłem śrenią itp
+	# select(toast_control:name) %>% 
+	select(toast_control, HP, mean, n_genes, name) %>% 
+	group_by(HP) %>% 
+	mutate(diff = mean - mean[toast_control=="control"]) %>% 
+	ungroup ->
+	results.bootstrap  # policzenie różniciy między średnimi stroki - controla
+results.bootstrap <- data.table(results.bootstrap)
+results.bootstrap[["pval_boot"]] <- 99
+
+# pokrycie dla losowych
+tic()
+
+n.samples <- 1000
+# all.hp.genes <- hp.data %>% pull(gene_id) %>% na.omit %>% unique
+# cardio.genes <- hp.data %>% filter(hp%in%cardiovascular) %>% pull(gene_id) %>% na.omit %>% unique
+# cardio.genes <- intersect(roh.genes.data %>% pull(ensembl_gene_id), cardio.genes)  # fix
+
+n.genes.in.hp <- results.bootstrap %>% pull(n_genes) %>% unique %>% sort  # fix
+n.genes.in.hp <- rev(n.genes.in.hp[n.genes.in.hp <= 400][-1])  # rev - more appropriate eta
+
+pb2 <- progress_bar$new(format = "  bootstraping [:bar] :percent eta: :eta", total = length(n.genes.in.hp))
+for(n.genes in n.genes.in.hp){
+	pl_laa <- numeric(n.samples)
+	pl_ce <- numeric(n.samples)
+	pl_sao <- numeric(n.samples)
+	pl_oc <- numeric(n.samples)
+	pl_und <- numeric(n.samples)
+	pl_stroke <- numeric(n.samples)
+	
+	for(i in 1:n.samples){
+		#TODO losowanie ze zwracaniem
+		smpl <- sample(all.hp.roh.genes, n.genes, replace = T)
+		# smpl <- sample((non.cardiovascular.genes), n.genes, replace = T)
+
+		means <- numeric(7)
+		for(gene in smpl){
+			means <- means + env.genes.to.mean.cnv[[gene]]
+		}
+
+		pl_laa[i] <- means[1] - means[7]
+		pl_ce[i] <- means[2] - means[7]
+		pl_sao[i] <- means[3] - means[7]
+		pl_oc[i] <- means[4] - means[7]
+		pl_und[i] <- means[5] - means[7]
+		pl_stroke[i] <- means[6] - means[7]
+		
+	}
+	
+	# obliczanie pvalue - czy wystarczy podzielić przez ilosc genów aby uniezależnić próg? (na razie zakładam, że nie) - oszacować błąd wpp
+	results.bootstrap[toast_control=="LAA" & n_genes==n.genes, "pval_boot"] <- 1 - ecdf(pl_laa)(unlist(results.bootstrap[toast_control=="LAA" & n_genes==n.genes, "diff"])-0.01)
+	results.bootstrap[toast_control=="CE" & n_genes==n.genes, "pval_boot"] <- 1 - ecdf(pl_ce)(unlist(results.bootstrap[toast_control=="CE" & n_genes==n.genes, "diff"])-0.01)
+	results.bootstrap[toast_control=="SAO" & n_genes==n.genes, "pval_boot"] <- 1 - ecdf(pl_sao)(unlist(results.bootstrap[toast_control=="SAO" & n_genes==n.genes, "diff"])-0.01)
+	results.bootstrap[toast_control=="OC" & n_genes==n.genes, "pval_boot"] <- 1 - ecdf(pl_oc)(unlist(results.bootstrap[toast_control=="OC" & n_genes==n.genes, "diff"])-0.01)
+	results.bootstrap[toast_control=="UND/UNCL" & n_genes==n.genes, "pval_boot"] <- 1 - ecdf(pl_und)(unlist(results.bootstrap[toast_control=="UND/UNCL" & n_genes==n.genes, "diff"])-0.01)
+	results.bootstrap[toast_control!="control" & n_genes==n.genes, "pval_boot"] <- 1 - ecdf(pl_stroke)(unlist(results.bootstrap[toast_control!="control" & n_genes==n.genes, "diff"])-0.01)
+	
+	pb2$tick()
+}
+toc()
+
+results.bootstrap %>%
+	mutate(pval_fdr = p.adjust(pval_boot, method="fdr")) %>%
+	mutate(cardio = HP %in% cardiovascular) %>% 
+	data.table() -> 
+	results.bootstrap
+
+
+x <- seq(0,1, length.out=1000)
+y <- quantile(results.bootstrap %>% filter(pval_boot!=99) %>%  arrange(pval_boot) %>% pull(pval_boot), probs=x)
+qqplot(-log(x), -log(y),ylim=c(0,15))
+abline(0,1)
+```
+
+```{r}
+results.bootstrap %>% 
+	filter(pval_boot <= 0.05) %>% 
+	filter(toast_control == "LAA")
+
+intersect()
+```
+
+### ~Sprawdzanie metody
+średnia kontrola/stroke dzielona przez liczbę genów
+średnie pokrycie w kontroli dla losowych genów (wszystkich)
+średnie pokrycie w kontroli dla genów cardio
+- losujemy geny(wszytkie/cardio) liczymy średnie pokrycie w kontroli/stroku unormowane przez liczbę genów
+- robimy wiele takich powtórzeń -> rozkład
+
+```{r}
+# geny vascular, i nie vascular
+hp.data %>% 
+	filter(hp %fin% cardiovascular) %>% 
+	pull(gene) %>% 
+	ensg_name() ->
+	cardiovascular.genes
+hp.data %>% 
+	filter(!hp %fin% cardiovascular) %>% 
+	pull(gene) %>% 
+	ensg_name() ->
+	non.cardiovascular.genes
+hp.data %>% 
+	pull(gene) %>% 
+	ensg_name() ->
+	all.hp.genes
+
+n.samples <- 500
+lt <- c(11,51,101,501)
+control.means <- vector()  #cardiac
+control2.means <- vector()	# cardiac + non cardiac
+stroke.means <- vector()
+stroke2.means <- vector()
+
+for(n.genes in lt){
+	print(n.genes)
+	ctrl.mn <- numeric(n.samples)
+	ctrl2.mn <- numeric(n.samples)
+	stroke.mn <- numeric(n.samples)
+	stroke2.mn <- numeric(n.samples)
+	pb2 <- txtProgressBar(min = 1, max = n.samples, style = 3)
+	for(i in 1:n.samples){
+		smpl <- sample(cardiovascular.genes, n.genes)#, replace=T)
+		# smpl.tb <- table(smpl)
+		smpl2 <- sample(all.hp.genes, n.genes)#, replace=T)
+		# smpl2.tb <- table(smpl2)
+		
+		.ptgc_stroke <- numeric(length(stroke_patients))
+		.ptgc_con <- numeric(length(control_patients))
+		for(j in 1:length(stroke_patients)){
+			# .ptgc_stroke[j] <- sum(smpl.tb[env.patients.to.genes[[stroke_patients[j]]]], na.rm = T)
+			.ptgc_stroke[j] <- sum(env.patients.to.genes[[stroke_patients[j]]] %fin% smpl)
+		}
+		stroke.mn[i] <- mean(.ptgc_stroke)
+
+		for(j in 1:length(stroke_patients)){
+			# .ptgc_stroke[j] <- sum(smpl2.tb[env.patients.to.genes[[stroke_patients[j]]]], na.rm = T)
+			.ptgc_stroke[j] <- sum(env.patients.to.genes[[stroke_patients[j]]] %fin% smpl2)
+		}
+		stroke2.mn[i] <- mean(.ptgc_stroke)
+		
+		for(j in 1:length(control_patients)){
+			# .ptgc_con[j] <- sum(smpl.tb[env.patients.to.genes[[control_patients[j]]]], na.rm = T)
+			.ptgc_con[j] <- sum(env.patients.to.genes[[control_patients[j]]] %fin% smpl)
+		}
+		ctrl.mn[i] <- mean(.ptgc_con)
+		
+		for(j in 1:length(control_patients)){
+			# .ptgc_con[j] <- sum(smpl2.tb[env.patients.to.genes[[control_patients[j]]]], na.rm = T)
+			.ptgc_con[j] <- sum(env.patients.to.genes[[control_patients[j]]] %fin% smpl2)
+		}
+		ctrl2.mn[i] <- mean(.ptgc_con)
+		
+		setTxtProgressBar(pb2, i)
+	}
+	cat("\nbez zwracania\n")
+	print(mean(ctrl.mn/n.genes - ctrl2.mn/n.genes))
+	
+	control.means <- c(control.means, ctrl.mn)
+	control2.means <- c(control2.means, ctrl2.mn)
+	stroke.means <- c(stroke.means, stroke.mn)
+	stroke2.means <- c(stroke2.means, stroke2.mn)
+	
+	close(pb2)
+}
+
+tibble("group"="control", "x"=density(control.means)$x, "y"=density(control.means)$y) %>% 
+	bind_rows(tibble("group"="control2", "x"=density(control2.means)$x, "y"=density(control2.means)$y)) -> ggplot.data
+ggplot(data=ggplot.data, aes(x=x, y=y, color=group)) +
+	geom_line()
+tibble("group"="stroke", "x"=density(stroke.means)$x, "y"=density(stroke.means)$y) %>% 
+	bind_rows(tibble("group"="stroke2", "x"=density(stroke2.means)$x, "y"=density(stroke2.means)$y)) -> ggplot.data
+ggplot(data=ggplot.data, aes(x=x, y=y, color=group)) +
+	geom_line()
+
+control.means2 <- c(control.means[1:n.samples]/11, control.means[(n.samples+1):(n.samples*2)]/51, control.means[(n.samples*2+1):(n.samples*3)]/101, control.means[(n.samples*3+1):(n.samples*4)]/501)
+control2.means2<-c(control2.means[1:n.samples]/11,control2.means[(n.samples+1):(n.samples*2)]/51,control2.means[(n.samples*2+1):(n.samples*3)]/101,control2.means[(n.samples*3+1):(n.samples*4)]/501)
+stroke.means2 <- c(stroke.means[1:n.samples]/11, stroke.means[(n.samples+1):(n.samples*2)]/51, stroke.means[(n.samples*2+1):(n.samples*3)]/101, stroke.means[(n.samples*3+1):(n.samples*4)]/501)
+stroke2.means2 <- c(stroke2.means[1:n.samples]/11, stroke2.means[(n.samples+1):(n.samples*2)]/51, stroke2.means[(n.samples*2+1):(n.samples*3)]/101, stroke2.means[(n.samples*3+1):(n.samples*4)]/501)
+tibble("group"="control", "x"=density(control.means2)$x, "y"=density(control.means2)$y) %>% 
+	bind_rows(tibble("group"="control2", "x"=density(control2.means2)$x, "y"=density(control2.means2)$y)) -> ggplot.data
+ggplot(data=ggplot.data, aes(x=x, y=y, color=group)) +
+	geom_line()
+tibble("group"="stroke", "x"=density(stroke.means2)$x, "y"=density(stroke.means2)$y) %>% 
+	bind_rows(tibble("group"="stroke2", "x"=density(stroke2.means2)$x, "y"=density(stroke2.means2)$y)) -> ggplot.data
+ggplot(data=ggplot.data, aes(x=x, y=y, color=group)) +
+	geom_line()
+
+```
+
+
+```{r}
+```
+
+## Pokrycie całego genomu - wykres
+grch37 to hg19?
+http://hgdownload.cse.ucsc.edu/downloads.html#human -> full data set > hg19.chrom.sizes
+http://hgdownload.cse.ucsc.edu/goldenPath/hg19/bigZips/hg19.chrom.sizes
+
+```{r}
+read_tsv("data/ucsc-hg19-chrom-sizes.txt", col_names=F, col_types="ci") %>% 
+	filter(X1 %in% paste0("chr", as.character(1:22))) %>% 
+	transmute(chr=as.numeric(str_sub(X1, start=4)), chrom_size=X2) %>% 
+	arrange(chr) %>% 
+	pull(chrom_size) -> 
+	chrom.sizes
+```
+
+Podział na biny i przygotowanie danych do wykresu.
+Plus statystyka istotności binów
+```{r}
+# data %>%
+# 	filter(chr == 1) %>%
+# 	select(chr, start_position, end_position, patient_id) %>%
+# 	mutate(start_mod = round(start_position / 1e6)) %>%
+# 	mutate(end_mod = round(end_position / 1e6)) %>%
+# 	arrange(start_mod) %>%
+# 	{hist(.$start_mod)}
+.bin.size <- 1e7
+# n.stroke <- n.stroke.patients
+# n.control <- n.control.patients
+n.stroke <- data %>% select(patient_id, toast_control) %>% distinct() %>% filter(toast_control!="control") %>% pull(patient_id) %>% length()
+n.control <- data %>% select(patient_id, toast_control) %>% distinct() %>% filter(toast_control=="control") %>% pull(patient_id) %>% length()
+8.615714e-04
+b.plt <- tibble(chr=integer(0), x=integer(0), stroke=double(0), control=double(0), p_val=double(0))
+
+for(.chr in 1:22){
+	data %>% 
+		filter(chr == .chr) %>%
+		filter(toast_control != "control") %>% 
+		select(chr, start_position, end_position, patient_id) %>% 
+		mutate(start_mod = round(start_position / .bin.size)) %>% 
+		mutate(end_mod = round(end_position / .bin.size)) ->
+		cov.stroke
+	data %>% 
+		filter(chr == .chr) %>%
+		filter(toast_control == "control") %>% 
+		select(chr, start_position, end_position, patient_id) %>% 
+		mutate(start_mod = round(start_position / .bin.size)) %>% 
+		mutate(end_mod = round(end_position / .bin.size)) ->
+		cov.control
+	
+	plt.stroke <- numeric(0)
+	for(i in 1:dim(cov.stroke)[1]){
+		plt.stroke <- c(plt.stroke, seq(cov.stroke$start_mod[i], cov.stroke$end_mod[i]))
+	}
+	
+	plt.control <- numeric(0)
+	for(i in 1:dim(cov.control)[1]){
+		plt.control <- c(plt.control, seq(cov.control$start_mod[i], cov.control$end_mod[i]))
+	}
+	
+	plt.stroke <- c(plt.stroke, 0:max(plt.stroke, plt.control))
+	plt.control <- c(plt.control, 0:max(plt.stroke, plt.control))
+	
+	
+	n.patients <- n.stroke + n.control
+	data.frame(cbind(as.matrix(table(plt.stroke))-1, as.matrix(table(plt.control))-1)) %>% 
+		tbl_df() %>% 
+		mutate(stroke=X1/n.stroke*100, control=X2/n.control*100) %>% 
+		mutate(chr=.chr) %>% 
+		mutate(x=0:max(plt.stroke, plt.control)) %>% 
+		select(chr, x, stroke, control, X1, X2) ->
+		a
+	
+	chisq.pval <- numeric(0)
+	for(b in a$x+1){
+		con.tb <- matrix(c(a$X2[b], a$X1[b], n.control - a$X2[b], n.stroke - a$X1[b]), nrow = 2)
+		chisq.pval <- c(chisq.pval, chisq.test(con.tb)$p.value)
+	}
+	a %>% 
+		mutate(p_val = -log(chisq.pval)) ->
+		a
+	
+	b.plt %>% 
+		bind_rows(a) ->
+		b.plt
+}
+b.plt %>% 
+	arrange(chr) %>% 
+	mutate(x=0:(n()-1)) ->
+	b.plt
+
+b.plt %>% 
+	group_by(chr) %>% 
+	summarise(n=n()) %>% 
+	mutate(cum_n_end=cumsum(n)) %>% 
+	mutate(cum_n_start=lag(cum_n_end, default=0)) %>% 
+	select(chr, n, cum_n_start, cum_n_end) ->
+	chr.sp2
+
+ggplot(data = b.plt, aes(x=x)) +
+	geom_rect(data=chr.sp2, aes(xmin=cum_n_start, xmax=cum_n_end, ymin=0, ymax=max(b.plt$stroke, b.plt$control)), inherit.aes=F, fill=rep(c("grey90", "white"), 11)) +
+	geom_line(aes(y=stroke), color="#E41A1C", size=0.3) +
+	geom_line(aes(y=control), color="#377EB8", size=0.3) +
+	geom_point(aes(y=p_val, alpha=1/(1+exp(- (p_val/(-log(0.05)))^8))), size=1) +
+	theme_classic() +
+	theme(legend.position="none") -> genome.plot
+	# geom_line(aes(y=-log(0.05)))
+print(genome.plot)
+
+```
+
+```{r}
+# stroke	covered_bin	uncovered_bin
+# FALSE 	6						770
+# TRUE 		29					922
+
+biomart.annot %>% 
+	filter(`Gene stable ID` %in% genes.list1) %>% 
+	filter(`Chromosome/scaffold name` %in% c("17", "2", "15", "4", "9", "6", "5", "16", "1", "11", "7")) %>% 
+	mutate(start_mod = round(`Gene start (bp)` / .bin.size)) %>% 
+	mutate(end_mod = round(`Gene end (bp)` / .bin.size)) %>% 
+	rename(chr=`Chromosome/scaffold name`, name=`Gene name`) %>% 
+	mutate(chr=as.integer(chr)) %>% 
+	select(chr, start_mod, name) ->
+	genes.list1.plt
+
+b.plt %>% 
+	group_by(chr) %>% 
+	summarise(n=n()) %>% 
+	mutate(cum_n=cumsum(n)) %>% 
+	select(chr, cum_n) %>% 
+	mutate(cum_n=lag(cum_n, default=0)) %>% 
+	as.list ->
+	chr.sp
+
+genes.list1.plt %>% 
+	rowwise() %>% 
+	mutate(start = start_mod + chr.sp$cum_n[chr.sp$chr == chr]) %>% 
+	select(chr, start, name) ->
+	genes.list1.plt
+	
+
+genome.plot + 
+	geom_point(data=genes.list1.plt, aes(x=start, y=-log(0.05)), color="#4DAF4A", shape=17, size=2) +
+	geom_text(data=genes.list1.plt, aes(x=start, y=max(b.plt$stroke, b.plt$control)/2, label=name), size=4, color="grey30", position = position_jitter(height = 2))
+
+```
+
+
+qqplot (liczba genów, pvalue)
+filtrowanie na liczbe genów
+
+powtórzenie wyników caspara
+metodyka
+wrzucenie na githuba
+
+```{r}
+results %>% 
+	filter(n_genes >= 5 & n_genes <= 300) %>% 
+	filter(n_genes >= 5 & n_genes <= 300) %>% 
+	filter(vascular==T) %>% 
+	filter(toast_control=="SAO") %>%
+	pull(pval) ->
+	vascular.pvals
+
+results %>% 
+	filter(n_genes >= 5 & n_genes <= 300) %>% 
+	filter(vascular==F) %>% 
+	filter(toast_control=="SAO") %>%
+	pull(pval) -> 
+	non.vascular.pvals
+
+qqx <- quantile(vascular.pvals, seq(0, 1, 0.01), na.rm=T, names=F)
+qqy <- quantile(non.vascular.pvals, seq(0, 1, 0.01), na.rm=T, names=F)
+	
+qqplot(-log10(vascular.pvals), -log10(non.vascular.pvals))
+abline(0, 1, col="red", lw=2)
+```
+
+
+
+
+
+
+
+
+```{r, eval=F}
+# 2000000001@1076271926.LOH.rawcnv.txt - nie ważne
+
+
+# http://grch37.ensembl.org/index.html
+# 
+# 1 3 w utracie heterozygotyczności
+# hg19?
+# 2000001807@1075710873
+
+
+# pb <- txtProgressBar(min = 0, max = 10, style = 3)
+# for(l in 1:10){
+# 	Sys.sleep(0.1)
+# 	setTxtProgressBar(pb, l)
+# }
+# close(pb)
+
+as.character(2000000000) # "2e9"
+
+data %>% 
+	group_by(toast_control) %>% 
+	summarise(m_g = median(n_genes)) %>% 
+	arrange(match(toast_control, c("LAA", "CE", "SAO", "OC", "UND/UNCL", "control")))
+```
+
+
+
+
+
+
+
+
+
